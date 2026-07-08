@@ -37,6 +37,16 @@ from typing import Any, Optional
 
 import requests
 
+# Force UTF-8 for this process's text I/O so console/file output does not crash
+# on non-locale-encodable bytes (e.g. cp949 on Korean Windows). Defensive; the
+# subprocess call also pins encoding explicitly.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -89,6 +99,12 @@ VENDOR_SUFFIX_VARIANTS = [
 #: for manual review. Applied to filename-mode PMs only (needs_build PMs like
 #: dotnet legitimately have many .csproj files).
 MAX_REASONABLE_MATCH_COUNT = 15
+
+#: Repos larger than this (KB, per GitHub repo ``size`` field) are excluded from
+#: candidacy entirely - too large to be useful/practical for build-analyzer test
+#: data, and wasteful to download (e.g. nixpkgs ~3.2GB, backstage ~5.8GB).
+#: Overridable via --max-size-kb.
+MAX_CANDIDATE_SIZE_KB = 300_000   # 300 MB
 
 #: GitHub API roots.
 GITHUB_API = "https://api.github.com"
@@ -413,12 +429,14 @@ def is_vendor_path(path: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def search_candidates(pm: str, min_stars: int = 0, max_candidates: int = 60) -> list[dict]:
+def search_candidates(pm: str, min_stars: int = 0, max_candidates: int = 60,
+                      max_size_kb: int = MAX_CANDIDATE_SIZE_KB) -> list[dict]:
     """Search GitHub for candidate repos for ``pm``.
 
     Uses the GitHub code search API with the PM's ``search_query``, de-duplicates
     to unique repositories, enriches each with stars/size/default_branch, applies
-    the ``min_stars`` filter, and returns up to ``max_candidates`` repo dicts.
+    the ``min_stars`` and ``max_size_kb`` filters, and returns up to
+    ``max_candidates`` repo dicts.
 
     Each returned dict has: owner, repo, stars, size_kb, default_branch.
     """
@@ -468,6 +486,13 @@ def search_candidates(pm: str, min_stars: int = 0, max_candidates: int = 60) -> 
             if info is None:
                 continue
             if info["stars"] < min_stars:
+                continue
+            if info["size_kb"] > max_size_kb:
+                log.debug(
+                    "[%s] skip %s/%s: size_kb=%d exceeds cap (%d) - too large "
+                    "for pilot dataset",
+                    pm, owner, name, info["size_kb"], max_size_kb,
+                )
                 continue
 
             candidates.append({
@@ -682,6 +707,8 @@ def dotnet_restore_and_repackage(zip_path: Path, info: Optional[dict] = None) ->
             cwd=str(restore_root),
             capture_output=True,
             text=True,
+            encoding="utf-8",   # don't rely on the OS locale (e.g. cp949 on
+            errors="replace",   # Korean Windows) - dotnet emits UTF-8
             timeout=DOTNET_RESTORE_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
@@ -732,14 +759,16 @@ def _now_iso() -> str:
 
 
 def collect_for_pm(pm: str, count: int, min_stars: int, output_root: Path,
-                   csv_path: Path) -> tuple[int, int]:
+                   csv_path: Path,
+                   max_size_kb: int = MAX_CANDIDATE_SIZE_KB) -> tuple[int, int]:
     """Collect ``count`` projects for a single PM. Returns (success, failed)."""
     cfg = PM_CONFIG[pm]
     pm_dir = output_root / "pilot_data" / pm
     pm_dir.mkdir(parents=True, exist_ok=True)
 
     candidates = search_candidates(pm, min_stars=min_stars,
-                                   max_candidates=max(count * 12, 30))
+                                   max_candidates=max(count * 12, 30),
+                                   max_size_kb=max_size_kb)
 
     success = 0
     failed = 0
@@ -892,6 +921,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="Number of projects to collect per PM (default 5).")
     parser.add_argument("--min-stars", type=int, default=0,
                         help="Minimum star count filter (default 0).")
+    parser.add_argument("--max-size-kb", type=int, default=MAX_CANDIDATE_SIZE_KB,
+                        help="Exclude candidate repos larger than this size in KB "
+                             f"(default {MAX_CANDIDATE_SIZE_KB:,}).")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT_ROOT,
                         help=f"Output root directory (default {DEFAULT_OUTPUT_ROOT}).")
     parser.add_argument("--verbose", action="store_true",
@@ -925,7 +957,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_root.mkdir(parents=True, exist_ok=True)
 
     log.info("Output root: %s", output_root)
-    log.info("Collecting PMs: %s (count=%d each)", ", ".join(pms), args.count)
+    log.info("Collecting PMs: %s (count=%d each, max_size_kb=%s)",
+             ", ".join(pms), args.count, f"{args.max_size_kb:,}")
 
     summary: dict[str, tuple[int, int]] = {}
     for pm in pms:
@@ -933,7 +966,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.info("PM: %s", pm)
         try:
             success, failed = collect_for_pm(
-                pm, args.count, args.min_stars, output_root, csv_path
+                pm, args.count, args.min_stars, output_root, csv_path,
+                max_size_kb=args.max_size_kb,
             )
         except Exception as exc:  # keep the whole run alive per requirement 9
             log.exception("[%s] unexpected error: %s", pm, exc)
