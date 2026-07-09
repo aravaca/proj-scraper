@@ -27,6 +27,8 @@ import csv
 import io
 import logging
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -53,7 +55,7 @@ if sys.platform == "win32":
 
 #: Root output directory. The script creates ``<OUTPUT_ROOT>/pilot_data/<pm>/``
 #: subfolders and writes ``<OUTPUT_ROOT>/collection_log.csv``.
-DEFAULT_OUTPUT_ROOT = Path(r"C:\Exception\Scraper2")
+DEFAULT_OUTPUT_ROOT = Path(r"C:\Exception\Scraper")
 
 #: Size thresholds (in KB, as reported by the GitHub repo ``size`` field which
 #: is in KB). Pulled out as constants so they are trivial to retune later.
@@ -566,22 +568,58 @@ def verify_match_file(owner: str, repo: str, pm: str,
     return sorted(matches)
 
 
-def has_npm_workspaces(owner: str, repo: str, branch: str) -> bool:
-    """Return True if the root package.json declares a ``workspaces`` field."""
+def get_file_text(owner: str, repo: str, path: str, branch: str) -> Optional[str]:
+    """Fetch a single file's text content via the GitHub Contents API.
+
+    Returns the decoded UTF-8 text, or None if the file is unavailable (missing,
+    too large for the contents API, non-text, or a request failure).
+    """
+    import base64
     resp = github_request(
         "GET",
-        f"{GITHUB_API}/repos/{owner}/{repo}/contents/package.json",
+        f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}",
         params={"ref": branch},
     )
     if resp is None or resp.status_code != 200:
-        return False
-    import base64
-    import json as _json
+        return None
     try:
-        content = base64.b64decode(resp.json().get("content", "")).decode("utf-8")
+        data = resp.json()
+        if data.get("encoding") != "base64" or "content" not in data:
+            return None
+        return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def has_npm_workspaces(owner: str, repo: str, branch: str) -> bool:
+    """Return True if the root package.json declares a ``workspaces`` field."""
+    import json as _json
+    content = get_file_text(owner, repo, "package.json", branch)
+    if content is None:
+        return False
+    try:
         return "workspaces" in _json.loads(content)
     except Exception:
         return False
+
+
+#: Matches an SDK-style project file: <Project Sdk="..."> attribute form, or the
+#: nested <Sdk .../> element form. Legacy .NET Framework csproj (packages.config
+#: based) use <Project ToolsVersion=... xmlns=...> with no Sdk and are excluded.
+_SDK_STYLE_RE = re.compile(r"<Project\b[^>]*\bSdk\s*=|<Sdk\b", re.IGNORECASE)
+
+
+def is_sdk_style_csproj(owner: str, repo: str, path: str, branch: str) -> bool:
+    """Return True if the given .csproj is SDK-style (modern ``dotnet restore``).
+
+    Fetches the .csproj content via the Contents API and checks for an ``Sdk``
+    attribute/element. Legacy .NET Framework projects (no Sdk, packages.config)
+    return False so they can be filtered out *before* download/restore.
+    """
+    content = get_file_text(owner, repo, path, branch)
+    if content is None:
+        return False
+    return bool(_SDK_STYLE_RE.search(content))
 
 
 def determine_structure(owner: str, repo: str, pm: str, branch: str,
@@ -658,79 +696,146 @@ def _rezip_dir(src_dir: Path, zip_path: Path) -> None:
                 zf.write(path, path.relative_to(src_dir.parent))
 
 
-def dotnet_restore_and_repackage(zip_path: Path, info: Optional[dict] = None) -> bool:
-    """Extract, ``dotnet restore``, verify obj/project.assets.json, and re-zip.
+#: Characters not allowed in Windows filenames: control chars (0x00-0x1f) and
+#: the reserved set < > : " | ? *.
+_WINDOWS_ILLEGAL_CHARS = re.compile(r'[\x00-\x1f<>:"|?*]')
 
-    Steps (per requirement 6):
-      1. Extract the downloaded zip.
+
+def _sanitize_path_component(name: str) -> str:
+    """Strip characters illegal in Windows filenames from a single path segment,
+    and strip trailing dots/spaces (also illegal on Windows)."""
+    cleaned = _WINDOWS_ILLEGAL_CHARS.sub("", name)
+    cleaned = cleaned.rstrip(" .")
+    return cleaned or "_"  # never produce an empty segment
+
+
+def safe_extractall(zf: zipfile.ZipFile, dest: Path) -> None:
+    """Extract a zip archive to ``dest``, sanitizing each path component so the
+    result is always a valid Windows path.
+
+    Source repos (often authored on Linux) may contain filenames with control
+    characters or other bytes that are illegal on Windows - e.g. a trailing
+    ``\\r`` in a filename - which make ``zipfile.extractall`` raise OSError.
+    """
+    for zinfo in zf.infolist():
+        parts = [p for p in zinfo.filename.split("/") if p not in ("", ".")]
+        safe_parts = [_sanitize_path_component(p) for p in parts]
+        if not safe_parts:
+            continue
+        target = dest.joinpath(*safe_parts)
+        if zinfo.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(zinfo) as src, open(target, "wb") as dst:
+            dst.write(src.read())
+
+
+def dotnet_restore_and_repackage(zip_path: Path, csproj_rel_paths: list[str],
+                                 info: Optional[dict] = None) -> bool:
+    """Extract, ``dotnet restore`` a specific .csproj, verify its assets, re-zip.
+
+    Steps:
+      1. Extract the downloaded zip (sanitizing illegal filenames).
       2. If a global.json exists, record the required SDK version.
-      3. Run ``dotnet restore`` (subprocess, with a timeout).
-      4. On failure, record the reason and return False (caller skips).
-      5. On success, verify obj/project.assets.json exists, then re-zip the
-         directory *in place* so the built state is preserved.
+      3. For each candidate .csproj (in the given order - the caller passes only
+         SDK-style ones), run ``dotnet restore <that .csproj>`` explicitly. This
+         avoids MSB1011 ("multiple project files") that occurs when restoring a
+         directory that contains more than one project file. The first .csproj
+         that restores AND produces obj/project.assets.json is accepted.
+      4. If none succeed, record the reason and return False (caller skips).
+      5. On success, re-zip the directory *in place* so the built state is kept.
 
     Args:
         zip_path: the downloaded repo zip (overwritten with the built state).
-        info: optional mutable dict; populated with ``dotnet_sdk_version`` and
-            ``fail_reason`` for the CSV row. (Kept as an optional param so the
-            documented ``-> bool`` signature is preserved.)
+        csproj_rel_paths: repo-root-relative paths of the .csproj files to try,
+            in preference order (caller pre-filters to SDK-style).
+        info: optional mutable dict; populated with ``dotnet_sdk_version``,
+            ``restored_csproj`` and ``fail_reason`` for the CSV row.
 
     Returns:
-        True if restore succeeded and project.assets.json was produced.
+        True if some .csproj restored and produced project.assets.json.
     """
     info = info if info is not None else {}
     work_dir = zip_path.with_suffix("")  # extraction dir alongside the zip
     if work_dir.exists():
-        import shutil
         shutil.rmtree(work_dir, ignore_errors=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    success = False
     try:
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(work_dir)
-    except zipfile.BadZipFile as exc:
-        info["fail_reason"] = f"bad zip: {exc}"
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                safe_extractall(zf, work_dir)
+        except (zipfile.BadZipFile, OSError) as exc:
+            info["fail_reason"] = f"extraction failed: {exc}"
+            return False
+
+        # codeload zips contain a single top-level folder; restore from there.
+        subdirs = [p for p in work_dir.iterdir() if p.is_dir()]
+        restore_root = subdirs[0] if len(subdirs) == 1 else work_dir
+
+        sdk_version = _read_global_json_sdk(restore_root)
+        if sdk_version:
+            info["dotnet_sdk_version"] = sdk_version
+            log.info("global.json pins SDK version %s", sdk_version)
+
+        if not csproj_rel_paths:
+            info["fail_reason"] = "no SDK-style .csproj to restore"
+            return False
+
+        # Try each candidate .csproj explicitly; first full success wins.
+        last_reason = "no csproj attempted"
+        for rel in csproj_rel_paths:
+            target = restore_root / Path(rel)
+            if not target.exists():
+                last_reason = f"csproj not found after extract: {rel}"
+                continue
+
+            try:
+                proc = subprocess.run(
+                    ["dotnet", "restore", str(target)],
+                    cwd=str(restore_root),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",   # don't rely on the OS locale (cp949 on
+                    errors="replace",   # Korean Windows) - dotnet emits UTF-8
+                    timeout=DOTNET_RESTORE_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                last_reason = f"dotnet restore timed out (>{DOTNET_RESTORE_TIMEOUT}s) on {rel}"
+                continue
+            except FileNotFoundError:
+                # dotnet missing is fatal for every candidate - stop early.
+                info["fail_reason"] = "dotnet CLI not found on PATH"
+                return False
+
+            if proc.returncode != 0:
+                tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-5:]
+                last_reason = f"restore failed on {rel}: " + " | ".join(tail)[:300]
+                continue
+
+            # Verify this project's own assets file was produced.
+            assets = list((target.parent / "obj").glob("project.assets.json"))
+            if not assets:
+                last_reason = f"restore ok but no obj/project.assets.json for {rel}"
+                continue
+
+            info["restored_csproj"] = rel
+            log.info("dotnet restore OK - %s -> %s", rel, assets[0].name)
+            _rezip_dir(restore_root, zip_path)
+            success = True
+            return True
+
+        info["fail_reason"] = f"all {len(csproj_rel_paths)} csproj restores failed; last: {last_reason}"
         return False
-
-    # codeload zips contain a single top-level folder; restore from there.
-    subdirs = [p for p in work_dir.iterdir() if p.is_dir()]
-    restore_root = subdirs[0] if len(subdirs) == 1 else work_dir
-
-    sdk_version = _read_global_json_sdk(restore_root)
-    if sdk_version:
-        info["dotnet_sdk_version"] = sdk_version
-        log.info("global.json pins SDK version %s", sdk_version)
-
-    try:
-        proc = subprocess.run(
-            ["dotnet", "restore"],
-            cwd=str(restore_root),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",   # don't rely on the OS locale (e.g. cp949 on
-            errors="replace",   # Korean Windows) - dotnet emits UTF-8
-            timeout=DOTNET_RESTORE_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        info["fail_reason"] = f"dotnet restore timed out (>{DOTNET_RESTORE_TIMEOUT}s)"
-        return False
-    except FileNotFoundError:
-        info["fail_reason"] = "dotnet CLI not found on PATH"
-        return False
-
-    if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-5:]
-        info["fail_reason"] = "dotnet restore failed: " + " | ".join(tail)[:400]
-        return False
-
-    assets = list(restore_root.rglob("obj/project.assets.json"))
-    if not assets:
-        info["fail_reason"] = "restore succeeded but no obj/project.assets.json produced"
-        return False
-
-    _rezip_dir(restore_root, zip_path)
-    log.info("dotnet restore OK - %d project.assets.json produced.", len(assets))
-    return True
+    finally:
+        # Always remove the extraction folder. On failure, also delete the
+        # downloaded zip so no trace of a rejected candidate is left in the
+        # output directory (CSV keeps the failure row for traceability).
+        shutil.rmtree(work_dir, ignore_errors=True)
+        if not success:
+            zip_path.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -777,38 +882,74 @@ def collect_for_pm(pm: str, count: int, min_stars: int, output_root: Path,
         if success >= count:
             break
 
-        owner, repo = cand["owner"], cand["repo"]
-        branch = cand["default_branch"]
-        repo_url = f"https://github.com/{owner}/{repo}"
+        # Per-candidate exception isolation: a single bad candidate (e.g. a zip
+        # with a Windows-illegal filename) must not abort the whole PM's loop.
+        try:
+            owner, repo = cand["owner"], cand["repo"]
+            branch = cand["default_branch"]
+            repo_url = f"https://github.com/{owner}/{repo}"
 
-        tree_paths, truncated = get_repo_tree(owner, repo, branch)
-        if truncated:
-            log.warning("%s/%s tree truncated - match detection is partial.",
-                        owner, repo)
+            tree_paths, truncated = get_repo_tree(owner, repo, branch)
+            if truncated:
+                log.warning("%s/%s tree truncated - match detection is partial.",
+                            owner, repo)
 
-        match_paths = verify_match_file(owner, repo, pm, tree_paths=tree_paths)
-        if not match_paths:
-            # Distinguish "no manifest at all" from "only vendored manifests"
-            # (all matches filtered out) for easier debugging.
-            raw = verify_match_file(owner, repo, pm, tree_paths=tree_paths,
-                                    include_vendor=True)
-            if raw:
-                log.info("[%s] skip %s/%s: only vendor-path matches found "
-                         "(0 valid after filtering)", pm, owner, repo)
-            else:
-                log.info("[%s] %s/%s: no match file - skipping.", pm, owner, repo)
-            continue
+            match_paths = verify_match_file(owner, repo, pm, tree_paths=tree_paths)
+            if not match_paths:
+                # Distinguish "no manifest at all" from "only vendored manifests"
+                # (all matches filtered out) for easier debugging.
+                raw = verify_match_file(owner, repo, pm, tree_paths=tree_paths,
+                                        include_vendor=True)
+                if raw:
+                    log.info("[%s] skip %s/%s: only vendor-path matches found "
+                             "(0 valid after filtering)", pm, owner, repo)
+                else:
+                    log.info("[%s] %s/%s: no match file - skipping.", pm, owner, repo)
+                continue
 
-        # Second-line defense: an implausibly large match count (for non-build
-        # PMs) usually means an unrecognized vendor directory slipped past the
-        # name filter. Skip and log for manual review instead of ingesting it.
-        if not cfg["needs_build"] and len(match_paths) > MAX_REASONABLE_MATCH_COUNT:
-            log.warning(
-                "[%s] skip %s/%s: match_count=%d exceeds sanity threshold (%d) "
-                "- likely unrecognized vendor directory, manual review needed",
-                pm, owner, repo, len(match_paths), MAX_REASONABLE_MATCH_COUNT,
+            # Second-line defense: an implausibly large match count (for non-build
+            # PMs) usually means an unrecognized vendor directory slipped past the
+            # name filter. Skip and log for manual review instead of ingesting it.
+            if not cfg["needs_build"] and len(match_paths) > MAX_REASONABLE_MATCH_COUNT:
+                log.warning(
+                    "[%s] skip %s/%s: match_count=%d exceeds sanity threshold (%d) "
+                    "- likely unrecognized vendor directory, manual review needed",
+                    pm, owner, repo, len(match_paths), MAX_REASONABLE_MATCH_COUNT,
+                )
+                log_result({
+                    "pm": pm,
+                    "repo_owner": owner,
+                    "repo_name": repo,
+                    "repo_url": repo_url,
+                    "match_file_paths": ";".join(match_paths),
+                    "match_count": len(match_paths),
+                    "stars": cand["stars"],
+                    "star_bucket": star_bucket(cand["stars"]),
+                    "size_kb": cand["size_kb"],
+                    "size_tag": size_tag(cand["size_kb"]),
+                    "status": "skipped_suspicious",
+                    "fail_reason": (f"match_count {len(match_paths)} > "
+                                    f"{MAX_REASONABLE_MATCH_COUNT}"),
+                    "collected_at": _now_iso(),
+                }, csv_path)
+                continue
+
+            match_dirs = {_dir_of(p) for p in match_paths}
+            structure = determine_structure(owner, repo, pm, branch, match_dirs)
+
+            # Precompute directory -> basenames for multi_pm detection.
+            dir_basenames: dict[str, set[str]] = {}
+            for p in tree_paths:
+                dir_basenames.setdefault(_dir_of(p), set()).add(_basename(p))
+
+            # Option A (pilot): one repo = one project = one count. All match paths
+            # are recorded in the log for later (Option B) monorepo splitting; the
+            # repo is flagged multi_pm if *any* match directory holds >1 PM's files.
+            multi_pm = any(
+                detect_multi_pm(dir_basenames.get(d, set())) for d in match_dirs
             )
-            log_result({
+
+            base_row = {
                 "pm": pm,
                 "repo_owner": owner,
                 "repo_name": repo,
@@ -819,86 +960,96 @@ def collect_for_pm(pm: str, count: int, min_stars: int, output_root: Path,
                 "star_bucket": star_bucket(cand["stars"]),
                 "size_kb": cand["size_kb"],
                 "size_tag": size_tag(cand["size_kb"]),
-                "status": "skipped_suspicious",
-                "fail_reason": (f"match_count {len(match_paths)} > "
-                                f"{MAX_REASONABLE_MATCH_COUNT}"),
+                "structure": structure,
+                "multi_pm": multi_pm,
+                "dotnet_sdk_version": "",
                 "collected_at": _now_iso(),
-            }, csv_path)
-            continue
+            }
 
-        match_dirs = {_dir_of(p) for p in match_paths}
-        structure = determine_structure(owner, repo, pm, branch, match_dirs)
+            # --- dotnet: pre-download SDK-style filtering. -------------------
+            # match_paths here are .csproj probe paths. Determine which are
+            # SDK-style *before* downloading; if none are, skip the repo
+            # entirely (legacy .NET Framework / packages.config projects are not
+            # restorable the same way and waste bandwidth/time). The SDK-style
+            # subset is what we later hand to dotnet_restore_and_repackage.
+            restore_targets: list[str] = []
+            if cfg["needs_build"]:
+                restore_targets = [
+                    p for p in match_paths
+                    if is_sdk_style_csproj(owner, repo, p, branch)
+                ]
+                if not restore_targets:
+                    log.info("[%s] skip %s/%s: no SDK-style .csproj among %d "
+                             "(legacy/packages.config) - filtered before download",
+                             pm, owner, repo, len(match_paths))
+                    log_result({
+                        **base_row,
+                        "status": "skipped_legacy",
+                        "fail_reason": ("no SDK-style .csproj "
+                                        f"(checked {len(match_paths)})"),
+                    }, csv_path)
+                    continue
+                log.info("[%s] %s/%s: %d/%d csproj are SDK-style -> will restore",
+                         pm, owner, repo, len(restore_targets), len(match_paths))
 
-        # Precompute directory -> basenames for multi_pm detection.
-        dir_basenames: dict[str, set[str]] = {}
-        for p in tree_paths:
-            dir_basenames.setdefault(_dir_of(p), set()).add(_basename(p))
-
-        # Option A (pilot): one repo = one project = one count. All match paths
-        # are recorded in the log for later (Option B) monorepo splitting; the
-        # repo is flagged multi_pm if *any* match directory holds >1 PM's files.
-        multi_pm = any(
-            detect_multi_pm(dir_basenames.get(d, set())) for d in match_dirs
-        )
-
-        base_row = {
-            "pm": pm,
-            "repo_owner": owner,
-            "repo_name": repo,
-            "repo_url": repo_url,
-            "match_file_paths": ";".join(match_paths),
-            "match_count": len(match_paths),
-            "stars": cand["stars"],
-            "star_bucket": star_bucket(cand["stars"]),
-            "size_kb": cand["size_kb"],
-            "size_tag": size_tag(cand["size_kb"]),
-            "structure": structure,
-            "multi_pm": multi_pm,
-            "dotnet_sdk_version": "",
-            "collected_at": _now_iso(),
-        }
-
-        # --- Download the repo zip once. ---
-        zip_path = pm_dir / f"{pm}_{owner}_{repo}.zip"
-        got = download_zip(owner, repo, zip_path, branch=branch)
-        if got is None:
-            failed += 1
-            row = dict(base_row)
-            row.update({
-                "status": "failed",
-                "fail_reason": "download failed after retries",
-            })
-            log_result(row, csv_path)
-            continue
-
-        # --- dotnet special handling: build + verify artifact + repackage. ---
-        if cfg["needs_build"]:
-            build_info: dict = {}
-            ok = dotnet_restore_and_repackage(zip_path, info=build_info)
-            base_row["dotnet_sdk_version"] = build_info.get("dotnet_sdk_version", "")
-            if not ok:
+            # --- Download the repo zip once. ---
+            zip_path = pm_dir / f"{pm}_{owner}_{repo}.zip"
+            got = download_zip(owner, repo, zip_path, branch=branch)
+            if got is None:
                 failed += 1
                 row = dict(base_row)
                 row.update({
                     "status": "failed",
-                    "fail_reason": build_info.get("fail_reason", "dotnet restore failed"),
+                    "fail_reason": "download failed after retries",
                 })
                 log_result(row, csv_path)
-                log.info("[%s] %s/%s build failed: %s",
-                         pm, owner, repo, row["fail_reason"])
                 continue
 
-        # --- One repo = one project = one count (Option A). ---
-        row = dict(base_row)
-        row.update({"status": "success", "fail_reason": ""})
-        log_result(row, csv_path)
-        success += 1
-        log.info(
-            "[%s] +1 (%d/%d) %s/%s :: %d matches (%s)%s",
-            pm, success, count, owner, repo,
-            len(match_paths), ", ".join(match_paths),
-            " [multi_pm]" if multi_pm else "",
-        )
+            # --- dotnet special handling: build + verify artifact + repackage. ---
+            if cfg["needs_build"]:
+                build_info: dict = {}
+                ok = dotnet_restore_and_repackage(
+                    zip_path, restore_targets, info=build_info)
+                base_row["dotnet_sdk_version"] = build_info.get("dotnet_sdk_version", "")
+                if not ok:
+                    failed += 1
+                    row = dict(base_row)
+                    row.update({
+                        "status": "failed",
+                        "fail_reason": build_info.get("fail_reason", "dotnet restore failed"),
+                    })
+                    log_result(row, csv_path)
+                    log.info("[%s] %s/%s build failed: %s",
+                             pm, owner, repo, row["fail_reason"])
+                    continue
+
+            # --- One repo = one project = one count (Option A). ---
+            row = dict(base_row)
+            row.update({"status": "success", "fail_reason": ""})
+            log_result(row, csv_path)
+            success += 1
+            log.info(
+                "[%s] +1 (%d/%d) %s/%s :: %d matches (%s)%s",
+                pm, success, count, owner, repo,
+                len(match_paths), ", ".join(match_paths),
+                " [multi_pm]" if multi_pm else "",
+            )
+
+        except Exception as exc:  # isolate to this candidate; keep the loop alive
+            failed += 1
+            log.exception("[%s] unexpected error processing %s/%s: %s",
+                          pm, cand.get("owner"), cand.get("repo"), exc)
+            log_result({
+                "pm": pm,
+                "repo_owner": cand.get("owner", ""),
+                "repo_name": cand.get("repo", ""),
+                "repo_url": f"https://github.com/{cand.get('owner','')}/"
+                            f"{cand.get('repo','')}",
+                "status": "failed",
+                "fail_reason": f"unexpected error: {exc}",
+                "collected_at": _now_iso(),
+            }, csv_path)
+            continue
 
     return success, failed
 

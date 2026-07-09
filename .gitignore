@@ -1,0 +1,5 @@
+pilot_data/
+*.zip
+.env
+__pycache__/
+*.bak_*
