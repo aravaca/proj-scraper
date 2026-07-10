@@ -55,7 +55,7 @@ if sys.platform == "win32":
 # Configuration
 # --------------------------------------------------------------------------- #
 
-#: Root output directory. The script creates ``<OUTPUT_ROOT>/pilot_data/<pm>/``
+#: Root output directory. The script creates ``<OUTPUT_ROOT>/data/<pm>/``
 #: subfolders and writes ``<OUTPUT_ROOT>/collection_log.csv``.
 DEFAULT_OUTPUT_ROOT = Path(r"C:\Exception\ScraperTest")
 
@@ -66,6 +66,9 @@ SIZE_MID_MAX_KB = 50_000         # <  50 MB  -> "mid", else "large"
 
 #: dotnet restore timeout (seconds).
 DOTNET_RESTORE_TIMEOUT = 600
+
+#: Search for COUNT * this many candidates to yield n final repos.
+CANDIDATE_MULTIPLIER = 4 
 
 #: Directory names that indicate third-party / build output. A match file whose
 #: path passes through any of these directories is not a real project manifest
@@ -111,8 +114,8 @@ MAX_REASONABLE_MATCH_COUNT = 15
 MAX_CANDIDATE_SIZE_KB = 300_000   # 300 MB
 
 #: GitHub API roots.
-GITHUB_API = "https://api.github.com"
-CODELOAD = "https://codeload.github.com"
+GITHUB_API = "https://api.github.com" # search api = 30 requests/min, core api = 5_000 requests/hour
+CODELOAD = "https://codeload.github.com"# for downloading zip archives, not included in rate limit
 
 #: Per-PM configuration. Adding a PM = adding an entry here.
 #:
@@ -187,7 +190,7 @@ PM_CONFIG: dict[str, dict[str, Any]] = {
     },
 }
 
-#: PMs included when ``--pm all`` is passed (the pilot set).
+#: PMs included when ``--pm all`` is passed.
 PMS = list(PM_CONFIG.keys())
 
 #: CSV column order.
@@ -216,14 +219,13 @@ log = logging.getLogger("collect")
 # HTTP session / GitHub request helpers
 # --------------------------------------------------------------------------- #
 
-
 def build_session() -> requests.Session:
     """Create a requests session pre-loaded with GitHub auth + UA headers."""
     session = requests.Session()
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "sca-pilot-collector",
+        "User-Agent": "proj-collector",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     if token:
@@ -245,6 +247,7 @@ def _sleep_until(reset_ts: float) -> None:
     wait = max(0.0, reset_ts - time.time()) + 2
     log.warning("Rate limit hit - sleeping %.0fs until reset.", wait)
     time.sleep(wait)
+
 
 
 def github_request(
@@ -342,7 +345,7 @@ def _filename_pm_index() -> dict[str, list[str]]:
         if cfg["match_mode"] != "filename":
             continue
         for fname in cfg["match_files"]:
-            index.setdefault(fname, []).append(pm)
+            index.setdefault(fname, []).append(pm) #setdefault returns the value
     return index
 
 
@@ -434,7 +437,7 @@ def is_vendor_path(path: str) -> bool:
 
 def search_candidates(pm: str, min_stars: int = 0, max_candidates: int = 60,
                       max_size_kb: int = MAX_CANDIDATE_SIZE_KB) -> list[dict]:
-    """Search GitHub for candidate repos for ``pm``.
+    """Search GitHub for candidate repos for ``pm`` before downloading any data.
 
     Uses the GitHub code search API with the PM's ``search_query``, de-duplicates
     to unique repositories, enriches each with stars/size/default_branch, applies
@@ -493,7 +496,7 @@ def search_candidates(pm: str, min_stars: int = 0, max_candidates: int = 60,
             if info["size_kb"] > max_size_kb:
                 log.debug(
                     "[%s] skip %s/%s: size_kb=%d exceeds cap (%d) - too large "
-                    "for pilot dataset",
+                    "for the dataset",
                     pm, owner, name, info["size_kb"], max_size_kb,
                 )
                 continue
@@ -869,11 +872,12 @@ def collect_for_pm(pm: str, count: int, min_stars: int, output_root: Path,
                    max_size_kb: int = MAX_CANDIDATE_SIZE_KB) -> tuple[int, int]:
     """Collect ``count`` projects for a single PM. Returns (success, failed)."""
     cfg = PM_CONFIG[pm]
-    pm_dir = output_root / "pilot_data" / pm
+    pm_dir = output_root / "data" / pm
     pm_dir.mkdir(parents=True, exist_ok=True)
 
+    # to reduce the number of candidate search, change the value below
     candidates = search_candidates(pm, min_stars=min_stars,
-                                   max_candidates=max(count * 12, 30),
+                                   max_candidates=max(count * CANDIDATE_MULTIPLIER, 30),
                                    max_size_kb=max_size_kb)
 
     success = 0
@@ -1133,7 +1137,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     for pm, (success, failed) in summary.items():
         print(f"  {pm:<10} success={success:<3} failed={failed}")
     print(f"\nLog: {csv_path}")
-    print(f"Data: {output_root / 'pilot_data'}")
+    print(f"Data: {output_root / 'data'}")
     return 0
 
 
