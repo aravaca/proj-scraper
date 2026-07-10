@@ -3,3 +3,6 @@ pilot_data/
 .env
 __pycache__/
 *.bak_*
+/build
+/dist
+*.spec

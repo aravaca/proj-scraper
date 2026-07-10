@@ -15,7 +15,7 @@ from typing import Any
 
 #: Root output directory. The script creates ``<OUTPUT_ROOT>/data/<pm>/``
 #: subfolders and writes ``<OUTPUT_ROOT>/collection_log.csv``.
-DEFAULT_OUTPUT_ROOT = Path(r"C:\Exception\ScraperTest")
+DEFAULT_OUTPUT_ROOT = Path(r"C:\Exception\Scraper")
 
 #: Size thresholds (in KB, as reported by the GitHub repo ``size`` field which
 #: is in KB). Pulled out as constants so they are trivial to retune later.
