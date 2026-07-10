@@ -49,13 +49,6 @@ $env:GITHUB_TOKEN = "ghp_여기에_본인_토큰_붙여넣기"
 
 위 예시는 "npm 프로젝트 5개를 받아라"라는 뜻입니다.
 
-### 3-3. "알 수 없는 게시자" 경고가 뜰 때
-
-처음 실행하면 Windows가 파란 화면으로 **"Windows의 PC 보호"** 경고를 띄울 수 있습니다.
-직접 만든 프로그램이라 서명이 없어서 그런 것이니, 아래처럼 진행하면 됩니다.
-
-1. **추가 정보** 클릭
-2. **실행** 버튼 클릭
 
 ---
 
@@ -74,7 +67,7 @@ $env:GITHUB_TOKEN = "ghp_여기에_본인_토큰_붙여넣기"
 ### `--pm`에 넣을 수 있는 값
 
 ```
-npm, yarn, maven, gradle, go, composer, dart, bundler, dotnet, all
+all, npm, yarn, maven, gradle, go, composer, dart, bundler, dotnet
 ```
 
 `all`을 넣으면 위 9개 매니저를 모두 수집합니다.
@@ -94,7 +87,7 @@ npm, yarn, maven, gradle, go, composer, dart, bundler, dotnet, all
 **특정 폴더에 저장하고 싶을 때**
 
 ```powershell
-.\collect.exe --pm npm --count 30 --out D:\수집결과
+.\collect.exe --pm npm --count 30 --out C:\수집결과
 ```
 
 **모든 매니저를 한 번에 수집하고 싶을 때**
@@ -103,7 +96,7 @@ npm, yarn, maven, gradle, go, composer, dart, bundler, dotnet, all
 .\collect.exe --pm all --count 10
 ```
 
-**실행이 잘 안 돼서 무슨 일이 벌어지는지 자세히 보고 싶을 때**
+**실행이 잘 안 돼서 디버깅 로그 보고 싶을 때**
 
 ```powershell
 .\collect.exe --pm npm --count 5 --verbose
@@ -113,8 +106,6 @@ npm, yarn, maven, gradle, go, composer, dart, bundler, dotnet, all
 
 ## 6. 실행하면 무슨 일이 일어나나요
 
-프로그램은 대략 아래 순서로 동작합니다. 그래서 프로젝트 개수가 많으면 시간이 걸립니다.
-
 - GitHub에서 조건에 맞는 후보 프로젝트를 검색합니다.
 - 각 후보가 조건에 맞는지 확인합니다. (저장소 크기, 진짜 프로젝트 설정 파일이 있는지, 라이브러리
   캐시 폴더만 잔뜩 든 건 아닌지 등)
@@ -123,8 +114,6 @@ npm, yarn, maven, gradle, go, composer, dart, bundler, dotnet, all
 - **dotnet의 경우에만**, 내려받은 뒤 실제로 빌드를 한 번 돌려서 정상 프로젝트인지 검증하는
   추가 단계가 있습니다. (이 과정 때문에 dotnet은 다른 것보다 오래 걸립니다.)
 - 최종적으로 각 프로젝트의 정보를 CSV 로그 파일에 정리해서 기록합니다.
-
-검색은 GitHub의 속도 제한이 있어서, 중간에 잠깐 기다리는 구간이 생길 수 있습니다. (정상입니다.)
 
 ---
 
@@ -136,7 +125,6 @@ npm, yarn, maven, gradle, go, composer, dart, bundler, dotnet, all
   예) `C:\Exception\ScraperTest\data\npm\npm_facebook_react.zip`
 - **정리된 결과표**: `collection_log.csv` 파일에 프로젝트마다 한 줄씩 기록됩니다.
   - 별점, 크기, 성공/실패 여부, (실패했다면) 실패 사유 등이 들어 있습니다.
-  - **엑셀로 열어서** 확인할 수 있습니다.
 
 ---
 
@@ -145,10 +133,6 @@ npm, yarn, maven, gradle, go, composer, dart, bundler, dotnet, all
 **"401" 또는 "Bad credentials" 오류가 뜨면?**
 - 토큰이 잘못 입력됐거나, 환경변수가 등록되지 않은 경우입니다.
 - 3-1 단계를 다시 실행해 토큰을 등록했는지, 토큰 문자열이 정확한지(앞뒤 공백/따옴표 확인) 다시
-  확인하세요. 토큰 만료일이 지났을 수도 있으니, 필요하면 새로 발급하세요.
-
-**실행이 너무 오래 걸리면?**
-- `dotnet`은 실제 빌드 과정이 있어서 원래 가장 오래 걸립니다. 멈춘 게 아니라 정상입니다.
-- 진행 상황을 보고 싶으면 `--verbose` 옵션을 붙여 실행하세요.
+  확인하세요.
 
 
