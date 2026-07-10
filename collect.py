@@ -1,21 +1,23 @@
+
 """GitHub open-source project collector for SCA build-analyzer testing.
+@author: Hyungsuk Choi, University of Maryland, 2026
 
-Pilot collector that gathers open-source repositories from GitHub, grouped by
+This project is a collector that gathers open-source repositories from GitHub, grouped by
 package manager (PM), for feeding an SCA (Software Composition Analysis) build
-analyzer.
-
-The pilot covers three PMs (npm / Yarn / dotnet) at 5 projects each, but the
-design is deliberately config-driven: to add the remaining PMs (Maven, Gradle,
-Go, Composer, Dart, Bundler) you only add an entry to ``PM_CONFIG`` - no logic
-changes required.
-
-Usage:
-    python collect.py --pm npm --count 5
-    python collect.py --pm all --count 5      # npm, yarn, dotnet
+analyzer. A total of nine package managers are supported: npm, yarn, dotnet, maven, 
+gradle, go, composer, dart, and bundler.
 
 Auth:
     Requires the ``GITHUB_TOKEN`` environment variable (GitHub code search needs
-    an authenticated request).
+    an authenticated request). Type below in PowerShell.
+
+        $env:GITHUB_TOKEN = "<your_personal_access_token>"
+
+    
+Usage:
+    python collect.py --pm npm --count 5      # collect 5 npm repos
+    python collect.py --pm all --count 5      # npm, yarn, dotnet each collects 5 repos
+
 
 Requires ``dotnet`` CLI on PATH for the dotnet special handling.
 """
@@ -55,7 +57,7 @@ if sys.platform == "win32":
 
 #: Root output directory. The script creates ``<OUTPUT_ROOT>/pilot_data/<pm>/``
 #: subfolders and writes ``<OUTPUT_ROOT>/collection_log.csv``.
-DEFAULT_OUTPUT_ROOT = Path(r"C:\Exception\Scraper")
+DEFAULT_OUTPUT_ROOT = Path(r"C:\Exception\ScraperTest")
 
 #: Size thresholds (in KB, as reported by the GitHub repo ``size`` field which
 #: is in KB). Pulled out as constants so they are trivial to retune later.
@@ -105,7 +107,7 @@ MAX_REASONABLE_MATCH_COUNT = 15
 #: Repos larger than this (KB, per GitHub repo ``size`` field) are excluded from
 #: candidacy entirely - too large to be useful/practical for build-analyzer test
 #: data, and wasteful to download (e.g. nixpkgs ~3.2GB, backstage ~5.8GB).
-#: Overridable via --max-size-kb.
+#: NOTE: Overridable via --max-size-kb.
 MAX_CANDIDATE_SIZE_KB = 300_000   # 300 MB
 
 #: GitHub API roots.
@@ -147,7 +149,6 @@ PM_CONFIG: dict[str, dict[str, Any]] = {
         "needs_build": True,
         "build_probe_ext": ".csproj",
     },
-    # --- Expansion PMs (not part of the pilot; enable by passing --pm <name>) ---
     "maven": {
         "search_query": "filename:pom.xml",
         "match_files": ["pom.xml"],
@@ -187,7 +188,7 @@ PM_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 #: PMs included when ``--pm all`` is passed (the pilot set).
-PILOT_PMS = ["npm", "yarn", "dotnet"]
+PMS = list(PM_CONFIG.keys())
 
 #: CSV column order.
 CSV_COLUMNS = [
@@ -1085,7 +1086,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 def resolve_pms(pm_arg: str) -> list[str]:
     """Resolve the --pm argument to a concrete list of PM names."""
     if pm_arg == "all":
-        return list(PILOT_PMS)
+        return list(PMS)
     if pm_arg not in PM_CONFIG:
         raise SystemExit(
             f"Unknown --pm '{pm_arg}'. Choose from: {', '.join(PM_CONFIG)}, all."
